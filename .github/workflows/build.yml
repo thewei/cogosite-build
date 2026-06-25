@@ -1,0 +1,179 @@
+name: Build and Deploy
+
+# ============================================================
+# Build & deploy pipeline for thewei/cogosite (private).
+# Triggered by cogosite's CI via `gh workflow run`, or manually
+# from the Actions UI. Builds cogosite at the requested ref,
+# optionally uploads the artifact and deploys. All credentials
+# come from GitHub secrets — the workflow itself has none.
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch/tag/SHA in cogosite to build'
+        required: true
+        default: 'main'
+      env:
+        description: 'Deploy target environment'
+        type: choice
+        options:
+          - prod
+          - dev
+        default: prod
+      deploy:
+        description: 'Upload to server and deploy after build?'
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Token must have `Contents: read` on thewei/cogosite.
+      - name: Checkout cogosite source
+        uses: actions/checkout@v6
+        with:
+          repository: thewei/cogosite
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GIT_PULL_TOKEN }}
+          lfs: true
+
+      - name: Compute short SHA
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9.4.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # BUILD_TIME=true gates build-only code paths in cogosite's build
+      # scripts. No runtime secrets (DATABASE_URL, etc.) are needed at
+      # build time — they are injected at runtime.
+      #
+      # NODE_OPTIONS: Nuxt build's Nitro phase (trace + bundle all server
+      # imports) pushes V8 past its ~4GB default heap. 8GB headroom fits
+      # comfortably on the 16GB ubuntu-latest runner.
+      #
+      # COMMIT_SHA / BUILD_TIME_ISO: baked into the .output via
+      # runtimeConfig.commitSha / runtimeConfig.buildTime. The running
+      # server exposes them at /api/__version, which the post-deploy
+      # verification step below polls.
+      - name: Build Nuxt app
+        env:
+          BUILD_TIME: 'true'
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          COMMIT_SHA: ${{ steps.meta.outputs.short_sha }}
+          BUILD_TIME_ISO: ${{ steps.meta.outputs.build_time }}
+        run: pnpm run build:nuxt
+
+      - name: Verify build output
+        run: |
+          test -f apps/nuxt-app/.output/server/index.mjs \
+            || { echo "::error::apps/nuxt-app/.output/server/index.mjs missing after build"; exit 1; }
+
+      # Pack the contents of .output (not the dir itself). --no-xattrs
+      # drops extended attrs (irrelevant cross-platform); the excludes
+      # scrub macOS noise.
+      - name: Pack .output
+        run: |
+          mkdir -p artifact
+          tar --no-xattrs --exclude='.DS_Store' --exclude='._*' \
+            -czf artifact/output.tar.gz \
+            -C apps/nuxt-app/.output .
+          ls -lh artifact/output.tar.gz
+
+      # Stream the tarball to the server via SSH stdin, then trigger the
+      # deploy script in a second SSH call.
+      - name: Write SSH key to tmpfile
+        if: ${{ inputs.deploy }}
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > /tmp/deploy.key
+          chmod 600 /tmp/deploy.key
+
+      - name: Stream tarball to server
+        if: ${{ inputs.deploy }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_ENV: ${{ inputs.env }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          ssh -i /tmp/deploy.key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=15 \
+              deploy@${DEPLOY_HOST} \
+              "cat > /tmp/cogosite-${DEPLOY_ENV}-${SHORT_SHA}.tar.gz" \
+            < artifact/output.tar.gz
+          echo "  uploaded ($(du -h artifact/output.tar.gz | cut -f1))"
+
+      - name: Trigger deploy script
+        if: ${{ inputs.deploy }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_ENV: ${{ inputs.env }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          ssh -i /tmp/deploy.key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=10 \
+              deploy@${DEPLOY_HOST} \
+              "/usr/local/bin/cogosite-deploy.sh ${DEPLOY_ENV} ${SHORT_SHA}"
+
+      - name: Cleanup SSH key
+        if: ${{ always() && inputs.deploy }}
+        run: rm -f /tmp/deploy.key
+
+      # Server-side deploy is async; poll /api/__version until the running
+      # container reports the SHA we just shipped. Worst case ~3 min for a
+      # slow restart; fail-fast otherwise.
+      - name: Verify deployment (env=${{ inputs.env }})
+        if: ${{ inputs.deploy }}
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+          EXPECTED_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$DEPLOY_ENV" = "prod" ]; then
+            BASE_URL="https://cogosite.com"
+          else
+            BASE_URL="https://dev.cogosite.com"
+          fi
+          echo "Polling $BASE_URL/api/__version for sha=$EXPECTED_SHA"
+          for i in $(seq 1 36); do
+            sleep 5
+            RESP=$(curl -s --max-time 5 "$BASE_URL/api/__version" || echo '{}')
+            ACTUAL_SHA=$(echo "$RESP" | jq -r '.sha // empty')
+            if [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]; then
+              echo "✓ verified at attempt $i/36"
+              echo "  sha:      $ACTUAL_SHA"
+              echo "  buildTime: $(echo "$RESP" | jq -r '.buildTime')"
+              echo "  uptime:   $(echo "$RESP" | jq -r '.runtime.uptime')s"
+              exit 0
+            fi
+            echo "  [$i/36] got sha='$ACTUAL_SHA', waiting 5s..."
+          done
+          echo "::error::Deploy verification timed out. $BASE_URL/api/__version did not report sha=$EXPECTED_SHA within 3 min."
+          exit 1
+
