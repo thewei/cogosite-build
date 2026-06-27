@@ -154,7 +154,11 @@ jobs:
           DEPLOY_ENV: ${{ inputs.env }}
           EXPECTED_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
-          set -euo pipefail
+          # NOTE: no `set -e` here. During Coolify's atomic symlink swap
+          # prod briefly returns 502 HTML or empty bodies; jq parse-fails
+          # on those and `set -e + pipefail` killed this step after 16s
+          # (run 28294852640). We retry the full 3-min window instead.
+          set -uo pipefail
           if [ "$DEPLOY_ENV" = "prod" ]; then
             BASE_URL="https://cogosite.com"
           else
@@ -164,7 +168,12 @@ jobs:
           for i in $(seq 1 36); do
             sleep 5
             RESP=$(curl -s --max-time 5 "$BASE_URL/api/__version" || echo '{}')
-            ACTUAL_SHA=$(echo "$RESP" | jq -r '.sha // empty')
+            # Defensive: mid-restart prod may serve HTML/empty — jq would
+            # parse-error and (under pipefail) kill the step. Skip and retry.
+            if ! ACTUAL_SHA=$(echo "$RESP" | jq -r '.sha // empty' 2>/dev/null); then
+              echo "  [$i/36] non-JSON response (likely mid-restart), waiting 5s..."
+              continue
+            fi
             if [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]; then
               echo "✓ verified at attempt $i/36"
               echo "  sha:      $ACTUAL_SHA"
