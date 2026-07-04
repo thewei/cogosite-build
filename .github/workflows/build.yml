@@ -6,6 +6,11 @@ name: Build and Deploy
 # from the Actions UI. Builds cogosite at the requested ref,
 # optionally uploads the artifact and deploys. All credentials
 # come from GitHub secrets — the workflow itself has none.
+#
+# monolith-split: the repo has three deployable Nuxt apps. The
+# `app` input selects which one to build/ship; `platform` keeps
+# the historical tar name and 2-arg deploy signature so the
+# server side needs zero change for it.
 # ============================================================
 
 on:
@@ -22,6 +27,14 @@ on:
           - prod
           - dev
         default: prod
+      app:
+        description: 'Which app to build/deploy'
+        type: choice
+        options:
+          - platform
+          - editor
+          - sites
+        default: platform
       deploy:
         description: 'Upload to server and deploy after build?'
         type: boolean
@@ -30,7 +43,7 @@ on:
 
 jobs:
   build-and-deploy:
-    name: Build & Deploy
+    name: Build & Deploy (${{ inputs.app }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,12 +57,44 @@ jobs:
           token: ${{ secrets.GIT_PULL_TOKEN }}
           lfs: true
 
-      - name: Compute short SHA
+      - name: Compute short SHA + app config
         id: meta
+        env:
+          APP: ${{ inputs.app }}
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          # Per-app config. platform keeps the historical tar prefix
+          # (cogosite-<env>-<sha>) so the server wrapper allow-list and
+          # deploy script signature stay unchanged for it.
+          case "$APP" in
+            platform)
+              echo "app_dir=apps/nuxt-app"          >> $GITHUB_OUTPUT
+              echo "build_script=build:nuxt"        >> $GITHUB_OUTPUT
+              echo "tar_prefix=cogosite"            >> $GITHUB_OUTPUT
+              echo "verify_host_prod=cogosite.com"  >> $GITHUB_OUTPUT
+              echo "verify_host_dev=dev.cogosite.com" >> $GITHUB_OUTPUT
+              ;;
+            editor)
+              echo "app_dir=apps/editor"            >> $GITHUB_OUTPUT
+              echo "build_script=build:editor"      >> $GITHUB_OUTPUT
+              echo "tar_prefix=cogosite-editor"     >> $GITHUB_OUTPUT
+              echo "verify_host_prod=editor.cogosite.com" >> $GITHUB_OUTPUT
+              echo "verify_host_dev=editor-dev.cogosite.com" >> $GITHUB_OUTPUT
+              ;;
+            sites)
+              echo "app_dir=apps/sites"             >> $GITHUB_OUTPUT
+              echo "build_script=build:sites"       >> $GITHUB_OUTPUT
+              echo "tar_prefix=cogosite-sites"      >> $GITHUB_OUTPUT
+              # sites serves wildcard tenant domains — no canonical apex
+              # to poll, so post-deploy verification is skipped for it.
+              echo "verify_host_prod="              >> $GITHUB_OUTPUT
+              echo "verify_host_dev="               >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error::unknown app '$APP'"; exit 1 ;;
+          esac
 
       - uses: pnpm/action-setup@v3
         with:
@@ -75,28 +120,32 @@ jobs:
       # runtimeConfig.commitSha / runtimeConfig.buildTime. The running
       # server exposes them at /api/__version, which the post-deploy
       # verification step below polls.
-      - name: Build Nuxt app
+      - name: Build Nuxt app (${{ inputs.app }})
         env:
           BUILD_TIME: 'true'
           NODE_OPTIONS: '--max-old-space-size=8192'
           COMMIT_SHA: ${{ steps.meta.outputs.short_sha }}
           BUILD_TIME_ISO: ${{ steps.meta.outputs.build_time }}
-        run: pnpm run build:nuxt
+        run: pnpm run ${{ steps.meta.outputs.build_script }}
 
       - name: Verify build output
+        env:
+          APP_DIR: ${{ steps.meta.outputs.app_dir }}
         run: |
-          test -f apps/nuxt-app/.output/server/index.mjs \
-            || { echo "::error::apps/nuxt-app/.output/server/index.mjs missing after build"; exit 1; }
+          test -f "$APP_DIR/.output/server/index.mjs" \
+            || { echo "::error::$APP_DIR/.output/server/index.mjs missing after build"; exit 1; }
 
       # Pack the contents of .output (not the dir itself). --no-xattrs
       # drops extended attrs (irrelevant cross-platform); the excludes
       # scrub macOS noise.
       - name: Pack .output
+        env:
+          APP_DIR: ${{ steps.meta.outputs.app_dir }}
         run: |
           mkdir -p artifact
           tar --no-xattrs --exclude='.DS_Store' --exclude='._*' \
             -czf artifact/output.tar.gz \
-            -C apps/nuxt-app/.output .
+            -C "$APP_DIR/.output" .
           ls -lh artifact/output.tar.gz
 
       # Stream the tarball to the server via SSH stdin, then trigger the
@@ -115,6 +164,7 @@ jobs:
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_ENV: ${{ inputs.env }}
+          TAR_PREFIX: ${{ steps.meta.outputs.tar_prefix }}
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
           set -euo pipefail
@@ -123,23 +173,32 @@ jobs:
               -o ConnectTimeout=10 \
               -o ServerAliveInterval=15 \
               deploy@${DEPLOY_HOST} \
-              "cat > /tmp/cogosite-${DEPLOY_ENV}-${SHORT_SHA}.tar.gz" \
+              "cat > /tmp/${TAR_PREFIX}-${DEPLOY_ENV}-${SHORT_SHA}.tar.gz" \
             < artifact/output.tar.gz
           echo "  uploaded ($(du -h artifact/output.tar.gz | cut -f1))"
 
+      # platform uses the historical 2-arg signature; editor/sites pass
+      # the app name as a 3rd arg (server-side cogosite-deploy.sh must
+      # support it — see cogosite docs/implementation/monolith-split-deploy.md).
       - name: Trigger deploy script
         if: ${{ inputs.deploy }}
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_ENV: ${{ inputs.env }}
+          APP: ${{ inputs.app }}
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
           set -euo pipefail
+          if [ "$APP" = "platform" ]; then
+            DEPLOY_CMD="/usr/local/bin/cogosite-deploy.sh ${DEPLOY_ENV} ${SHORT_SHA}"
+          else
+            DEPLOY_CMD="/usr/local/bin/cogosite-deploy.sh ${DEPLOY_ENV} ${SHORT_SHA} ${APP}"
+          fi
           ssh -i /tmp/deploy.key \
               -o StrictHostKeyChecking=accept-new \
               -o ConnectTimeout=10 \
               deploy@${DEPLOY_HOST} \
-              "/usr/local/bin/cogosite-deploy.sh ${DEPLOY_ENV} ${SHORT_SHA}"
+              "$DEPLOY_CMD"
 
       - name: Cleanup SSH key
         if: ${{ always() && inputs.deploy }}
@@ -147,12 +206,15 @@ jobs:
 
       # Server-side deploy is async; poll /api/__version until the running
       # container reports the SHA we just shipped. Worst case ~3 min for a
-      # slow restart; fail-fast otherwise.
-      - name: Verify deployment (env=${{ inputs.env }})
+      # slow restart; fail-fast otherwise. Skipped for apps without a
+      # canonical host (sites — wildcard tenant domains only).
+      - name: Verify deployment (app=${{ inputs.app }} env=${{ inputs.env }})
         if: ${{ inputs.deploy }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           EXPECTED_SHA: ${{ steps.meta.outputs.short_sha }}
+          VERIFY_HOST_PROD: ${{ steps.meta.outputs.verify_host_prod }}
+          VERIFY_HOST_DEV: ${{ steps.meta.outputs.verify_host_dev }}
         run: |
           # NOTE: no `set -e` here. During Coolify's atomic symlink swap
           # prod briefly returns 502 HTML or empty bodies; jq parse-fails
@@ -160,10 +222,16 @@ jobs:
           # (run 28294852640). We retry the full 3-min window instead.
           set -uo pipefail
           if [ "$DEPLOY_ENV" = "prod" ]; then
-            BASE_URL="https://cogosite.com"
+            VERIFY_HOST="$VERIFY_HOST_PROD"
           else
-            BASE_URL="https://dev.cogosite.com"
+            VERIFY_HOST="$VERIFY_HOST_DEV"
           fi
+          if [ -z "$VERIFY_HOST" ]; then
+            echo "No canonical host for this app — skipping /api/__version verification."
+            echo "Verify manually against a tenant domain if needed."
+            exit 0
+          fi
+          BASE_URL="https://${VERIFY_HOST}"
           echo "Polling $BASE_URL/api/__version for sha=$EXPECTED_SHA"
           for i in $(seq 1 36); do
             sleep 5
@@ -185,4 +253,3 @@ jobs:
           done
           echo "::error::Deploy verification timed out. $BASE_URL/api/__version did not report sha=$EXPECTED_SHA within 3 min."
           exit 1
-
