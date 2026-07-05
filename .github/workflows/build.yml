@@ -25,7 +25,7 @@ on:
         type: choice
         options:
           - prod
-          - dev
+          - uat
         default: prod
       app:
         description: 'Which app to build/deploy'
@@ -74,14 +74,12 @@ jobs:
               echo "build_script=build:nuxt"        >> $GITHUB_OUTPUT
               echo "tar_prefix=cogosite"            >> $GITHUB_OUTPUT
               echo "verify_host_prod=cogosite.com"  >> $GITHUB_OUTPUT
-              echo "verify_host_dev=dev.cogosite.com" >> $GITHUB_OUTPUT
               ;;
             editor)
               echo "app_dir=apps/editor"            >> $GITHUB_OUTPUT
               echo "build_script=build:editor"      >> $GITHUB_OUTPUT
               echo "tar_prefix=cogosite-editor"     >> $GITHUB_OUTPUT
               echo "verify_host_prod=editor.cogosite.com" >> $GITHUB_OUTPUT
-              echo "verify_host_dev=editor-dev.cogosite.com" >> $GITHUB_OUTPUT
               ;;
             sites)
               echo "app_dir=apps/sites"             >> $GITHUB_OUTPUT
@@ -90,7 +88,6 @@ jobs:
               # sites serves wildcard tenant domains — no canonical apex
               # to poll, so post-deploy verification is skipped for it.
               echo "verify_host_prod="              >> $GITHUB_OUTPUT
-              echo "verify_host_dev="               >> $GITHUB_OUTPUT
               ;;
             *)
               echo "::error::unknown app '$APP'"; exit 1 ;;
@@ -214,18 +211,23 @@ jobs:
           DEPLOY_ENV: ${{ inputs.env }}
           EXPECTED_SHA: ${{ steps.meta.outputs.short_sha }}
           VERIFY_HOST_PROD: ${{ steps.meta.outputs.verify_host_prod }}
-          VERIFY_HOST_DEV: ${{ steps.meta.outputs.verify_host_dev }}
         run: |
           # NOTE: no `set -e` here. During Coolify's atomic symlink swap
           # prod briefly returns 502 HTML or empty bodies; jq parse-fails
           # on those and `set -e + pipefail` killed this step after 16s
           # (run 28294852640). We retry the full 3-min window instead.
+          #
+          # UAT verification is skipped: UAT sits behind Traefik Basic Auth
+          # so /api/__version returns 401 to unauthenticated polling. UAT
+          # deploys are verified out-of-band (e.g. docker exec inside the
+          # container, or authenticated curl from a trusted host).
           set -uo pipefail
-          if [ "$DEPLOY_ENV" = "prod" ]; then
-            VERIFY_HOST="$VERIFY_HOST_PROD"
-          else
-            VERIFY_HOST="$VERIFY_HOST_DEV"
+          if [ "$DEPLOY_ENV" != "prod" ]; then
+            echo "Skipping /api/__version verification for env=$DEPLOY_ENV (non-prod)."
+            echo "Verify manually if needed."
+            exit 0
           fi
+          VERIFY_HOST="$VERIFY_HOST_PROD"
           if [ -z "$VERIFY_HOST" ]; then
             echo "No canonical host for this app — skipping /api/__version verification."
             echo "Verify manually against a tenant domain if needed."
