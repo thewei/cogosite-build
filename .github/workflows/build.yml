@@ -132,6 +132,54 @@ jobs:
           test -f "$APP_DIR/.output/server/index.mjs" \
             || { echo "::error::$APP_DIR/.output/server/index.mjs missing after build"; exit 1; }
 
+      # Pre-deploy db:migrate (fail-fast): run pending migrations via SSH
+      # tunnel before shipping. Only platform carries migrations; editor/sites
+      # skip this step. Failure aborts the entire workflow — old code stays live.
+      - name: Pre-deploy db:migrate (fail-fast)
+        if: ${{ inputs.deploy && inputs.app == 'platform' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_ENV: ${{ inputs.env }}
+          DB_INTERNAL_HOST: ${{ secrets.DB_INTERNAL_HOST }}
+          PROD_DB_NAME: ${{ secrets.PROD_DB_NAME }}
+          UAT_DB_NAME: ${{ secrets.UAT_DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Skip if DB secrets are not configured (graceful degradation).
+          if [ -z "${DB_INTERNAL_HOST:-}" ] || [ -z "${DB_PASSWORD:-}" ]; then
+            echo "::warning::DB secrets not configured — skipping pre-deploy migrate. Container boot plugin will handle it."
+            exit 0
+          fi
+          # Select database name by environment.
+          case "$DEPLOY_ENV" in
+            prod) DB_NAME="$PROD_DB_NAME" ;;
+            uat)  DB_NAME="$UAT_DB_NAME"  ;;
+            *)    echo "::error::unknown env '$DEPLOY_ENV'"; exit 1 ;;
+          esac
+          # Write SSH key.
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > /tmp/migrate.key
+          chmod 600 /tmp/migrate.key
+          # Establish SSH tunnel: local:54321 → DB container:5432.
+          ssh -f -N -L 54321:${DB_INTERNAL_HOST}:5432 \
+              -i /tmp/migrate.key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=10 \
+              deploy@${DEPLOY_HOST}
+          # Run drizzle migrate through the tunnel.
+          export DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@localhost:54321/${DB_NAME}"
+          if pnpm db:migrate; then
+            echo "✓ remote schema synced for env=$DEPLOY_ENV"
+          else
+            echo "::error::db:migrate failed — deploy aborted, old release still live."
+            rm -f /tmp/migrate.key
+            exit 1
+          fi
+          rm -f /tmp/migrate.key
+
       # Pack the contents of .output (not the dir itself). --no-xattrs
       # drops extended attrs (irrelevant cross-platform); the excludes
       # scrub macOS noise.
