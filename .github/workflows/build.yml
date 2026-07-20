@@ -102,7 +102,15 @@ jobs:
           node-version: 22
           cache: 'pnpm'
 
+      - name: Cache node_modules
+        id: cache-nm
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: nm-${{ hashFiles('pnpm-lock.yaml') }}
+
       - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true'
         run: pnpm install --frozen-lockfile
 
       # BUILD_TIME=true gates build-only code paths in cogosite's build
@@ -147,44 +155,50 @@ jobs:
 
       # Stream the tarball to the server via SSH stdin, then trigger the
       # deploy script in a second SSH call.
-      - name: Write SSH key to tmpfile
+      - name: Write SSH key + setup multiplexing
         if: ${{ inputs.deploy }}
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           umask 077
           printf '%s\n' "$DEPLOY_SSH_KEY" > /tmp/deploy.key
           chmod 600 /tmp/deploy.key
+          mkdir -p ~/.ssh
+          cat >> ~/.ssh/config <<SSH
+          Host deploy-target
+            HostName ${DEPLOY_HOST}
+            User deploy
+            IdentityFile /tmp/deploy.key
+            StrictHostKeyChecking accept-new
+            ConnectTimeout 10
+            ServerAliveInterval 15
+            ControlMaster auto
+            ControlPath /tmp/ssh-mux-%r@%h:%p
+            ControlPersist 120s
+          SSH
 
       # IaC: sync server-side scripts from the repo to the server.
       # Only on platform deploys (scripts are shared, no need to sync thrice).
       # Source of truth: cogosite (private) scripts/server/*.sh
       - name: Sync server scripts
         if: ${{ inputs.deploy && inputs.app == 'platform' }}
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           set -euo pipefail
-          SSH_CMD="ssh -i /tmp/deploy.key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
           for f in cogosite-deploy.sh cogosite-migrate.sh cogosite-ssh-wrapper.sh; do
-            $SSH_CMD deploy@${DEPLOY_HOST} "cat > /tmp/$f" < scripts/server/$f
+            ssh deploy-target "cat > /tmp/$f" < scripts/server/$f
           done
-          $SSH_CMD deploy@${DEPLOY_HOST} "install-server-scripts"
+          ssh deploy-target "install-server-scripts"
 
       - name: Stream tarball to server
         if: ${{ inputs.deploy }}
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_ENV: ${{ inputs.env }}
           TAR_PREFIX: ${{ steps.meta.outputs.tar_prefix }}
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
           set -euo pipefail
-          ssh -i /tmp/deploy.key \
-              -o StrictHostKeyChecking=accept-new \
-              -o ConnectTimeout=10 \
-              -o ServerAliveInterval=15 \
-              deploy@${DEPLOY_HOST} \
+          ssh deploy-target \
               "cat > /tmp/${TAR_PREFIX}-${DEPLOY_ENV}-${SHORT_SHA}.tar.gz" \
             < artifact/output.tar.gz
           echo "  uploaded ($(du -h artifact/output.tar.gz | cut -f1))"
@@ -195,7 +209,6 @@ jobs:
       - name: Trigger deploy script
         if: ${{ inputs.deploy }}
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_ENV: ${{ inputs.env }}
           APP: ${{ inputs.app }}
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
@@ -206,15 +219,13 @@ jobs:
           else
             DEPLOY_CMD="/usr/local/bin/cogosite-deploy.sh ${DEPLOY_ENV} ${SHORT_SHA} ${APP}"
           fi
-          ssh -i /tmp/deploy.key \
-              -o StrictHostKeyChecking=accept-new \
-              -o ConnectTimeout=10 \
-              deploy@${DEPLOY_HOST} \
-              "$DEPLOY_CMD"
+          ssh deploy-target "$DEPLOY_CMD"
 
-      - name: Cleanup SSH key
+      - name: Cleanup SSH
         if: ${{ always() && inputs.deploy }}
-        run: rm -f /tmp/deploy.key
+        run: |
+          ssh -O exit deploy-target 2>/dev/null || true
+          rm -f /tmp/deploy.key /tmp/ssh-mux-*
 
       # Server-side deploy is async; poll /api/__version until the running
       # container reports the SHA we just shipped. Worst case ~3 min for a
