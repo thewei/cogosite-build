@@ -131,6 +131,8 @@ jobs:
           NODE_OPTIONS: '--max-old-space-size=8192'
           COMMIT_SHA: ${{ steps.meta.outputs.short_sha }}
           BUILD_TIME_ISO: ${{ steps.meta.outputs.build_time }}
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
         run: pnpm run ${{ steps.meta.outputs.build_script }}
 
       - name: Verify build output
