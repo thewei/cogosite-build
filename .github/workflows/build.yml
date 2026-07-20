@@ -156,6 +156,21 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > /tmp/deploy.key
           chmod 600 /tmp/deploy.key
 
+      # IaC: sync server-side scripts from the repo to the server.
+      # Only on platform deploys (scripts are shared, no need to sync thrice).
+      # Source of truth: cogosite (private) scripts/server/*.sh
+      - name: Sync server scripts
+        if: ${{ inputs.deploy && inputs.app == 'platform' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          SSH_CMD="ssh -i /tmp/deploy.key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+          for f in cogosite-deploy.sh cogosite-migrate.sh cogosite-ssh-wrapper.sh; do
+            $SSH_CMD deploy@${DEPLOY_HOST} "cat > /tmp/$f" < scripts/server/$f
+          done
+          $SSH_CMD deploy@${DEPLOY_HOST} "install-server-scripts"
+
       - name: Stream tarball to server
         if: ${{ inputs.deploy }}
         env:
