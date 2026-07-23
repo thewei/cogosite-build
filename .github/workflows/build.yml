@@ -1,18 +1,5 @@
 name: Build and Deploy
 
-# ============================================================
-# Build & deploy pipeline for thewei/cogosite (private).
-# Triggered by cogosite's CI via `gh workflow run`, or manually
-# from the Actions UI. Builds cogosite at the requested ref,
-# optionally uploads the artifact and deploys. All credentials
-# come from GitHub secrets — the workflow itself has none.
-#
-# monolith-split: the repo has three deployable Nuxt apps. The
-# `app` input selects which one to build/ship; `platform` keeps
-# the historical tar name and 2-arg deploy signature so the
-# server side needs zero change for it.
-# ============================================================
-
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +35,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Token must have `Contents: read` on thewei/cogosite.
       - name: Checkout cogosite source
         uses: actions/checkout@v6
         with:
@@ -65,9 +51,6 @@ jobs:
           SHORT_SHA=$(git rev-parse --short HEAD)
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
-          # Per-app config. platform keeps the historical tar prefix
-          # (cogosite-<env>-<sha>) so the server wrapper allow-list and
-          # deploy script signature stay unchanged for it.
           case "$APP" in
             platform)
               echo "app_dir=apps/nuxt-app"          >> $GITHUB_OUTPUT
@@ -85,8 +68,6 @@ jobs:
               echo "app_dir=apps/sites"             >> $GITHUB_OUTPUT
               echo "build_script=build:sites"       >> $GITHUB_OUTPUT
               echo "tar_prefix=cogosite-sites"      >> $GITHUB_OUTPUT
-              # sites serves wildcard tenant domains — no canonical apex
-              # to poll, so post-deploy verification is skipped for it.
               echo "verify_host_prod="              >> $GITHUB_OUTPUT
               ;;
             *)
@@ -107,24 +88,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: node_modules
-          key: nm-${{ hashFiles('pnpm-lock.yaml') }}
+          key: nm-${{ hashFiles('**/pnpm-lock.yaml') }}
 
       - name: Install dependencies
         if: steps.cache-nm.outputs.cache-hit != 'true'
         run: pnpm install --frozen-lockfile
 
-      # BUILD_TIME=true gates build-only code paths in cogosite's build
-      # scripts. No runtime secrets (DATABASE_URL, etc.) are needed at
-      # build time — they are injected at runtime.
-      #
-      # NODE_OPTIONS: Nuxt build's Nitro phase (trace + bundle all server
-      # imports) pushes V8 past its ~4GB default heap. 8GB headroom fits
-      # comfortably on the 16GB ubuntu-latest runner.
-      #
-      # COMMIT_SHA / BUILD_TIME_ISO: baked into the .output via
-      # runtimeConfig.commitSha / runtimeConfig.buildTime. The running
-      # server exposes them at /api/__version, which the post-deploy
-      # verification step below polls.
       - name: Build Nuxt app (${{ inputs.app }})
         env:
           BUILD_TIME: 'true'
@@ -142,9 +111,6 @@ jobs:
           test -f "$APP_DIR/.output/server/index.mjs" \
             || { echo "::error::$APP_DIR/.output/server/index.mjs missing after build"; exit 1; }
 
-      # Pack the contents of .output (not the dir itself). --no-xattrs
-      # drops extended attrs (irrelevant cross-platform); the excludes
-      # scrub macOS noise.
       - name: Pack .output
         env:
           APP_DIR: ${{ steps.meta.outputs.app_dir }}
@@ -155,8 +121,6 @@ jobs:
             -C "$APP_DIR/.output" .
           ls -lh artifact/output.tar.gz
 
-      # Stream the tarball to the server via SSH stdin, then trigger the
-      # deploy script in a second SSH call.
       - name: Write SSH key + setup multiplexing
         if: ${{ inputs.deploy }}
         env:
@@ -180,9 +144,6 @@ jobs:
             ControlPersist 120s
           SSH
 
-      # IaC: sync server-side scripts from the repo to the server.
-      # Only on platform deploys (scripts are shared, no need to sync thrice).
-      # Source of truth: cogosite (private) scripts/server/*.sh
       - name: Sync server scripts
         if: ${{ inputs.deploy && inputs.app == 'platform' }}
         run: |
@@ -205,9 +166,6 @@ jobs:
             < artifact/output.tar.gz
           echo "  uploaded ($(du -h artifact/output.tar.gz | cut -f1))"
 
-      # platform uses the historical 2-arg signature; editor/sites pass
-      # the app name as a 3rd arg (server-side cogosite-deploy.sh must
-      # support it — see cogosite docs/implementation/monolith-split-deploy.md).
       - name: Trigger deploy script
         if: ${{ inputs.deploy }}
         env:
@@ -229,10 +187,6 @@ jobs:
           ssh -O exit deploy-target 2>/dev/null || true
           rm -f /tmp/deploy.key /tmp/ssh-mux-*
 
-      # Server-side deploy is async; poll /api/__version until the running
-      # container reports the SHA we just shipped. Worst case ~3 min for a
-      # slow restart; fail-fast otherwise. Skipped for apps without a
-      # canonical host (sites — wildcard tenant domains only).
       - name: Verify deployment (app=${{ inputs.app }} env=${{ inputs.env }})
         if: ${{ inputs.deploy }}
         env:
@@ -240,15 +194,6 @@ jobs:
           EXPECTED_SHA: ${{ steps.meta.outputs.short_sha }}
           VERIFY_HOST_PROD: ${{ steps.meta.outputs.verify_host_prod }}
         run: |
-          # NOTE: no `set -e` here. During Coolify's atomic symlink swap
-          # prod briefly returns 502 HTML or empty bodies; jq parse-fails
-          # on those and `set -e + pipefail` killed this step after 16s
-          # (run 28294852640). We retry the full 3-min window instead.
-          #
-          # UAT verification is skipped: UAT sits behind Traefik Basic Auth
-          # so /api/__version returns 401 to unauthenticated polling. UAT
-          # deploys are verified out-of-band (e.g. docker exec inside the
-          # container, or authenticated curl from a trusted host).
           set -uo pipefail
           if [ "$DEPLOY_ENV" != "prod" ]; then
             echo "Skipping /api/__version verification for env=$DEPLOY_ENV (non-prod)."
@@ -266,8 +211,6 @@ jobs:
           for i in $(seq 1 36); do
             sleep 5
             RESP=$(curl -s --max-time 5 "$BASE_URL/api/__version" || echo '{}')
-            # Defensive: mid-restart prod may serve HTML/empty — jq would
-            # parse-error and (under pipefail) kill the step. Skip and retry.
             if ! ACTUAL_SHA=$(echo "$RESP" | jq -r '.sha // empty' 2>/dev/null); then
               echo "  [$i/36] non-JSON response (likely mid-restart), waiting 5s..."
               continue
